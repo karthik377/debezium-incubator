@@ -11,12 +11,10 @@ import static io.debezium.connector.cassandra.CommitLogReadHandlerImpl.RowType.U
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Set;
+import java.util.*;
 import java.util.concurrent.TimeUnit;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import org.apache.cassandra.config.ColumnDefinition;
 import org.apache.cassandra.config.DatabaseDescriptor;
@@ -26,11 +24,11 @@ import org.apache.cassandra.db.Mutation;
 import org.apache.cassandra.db.commitlog.CommitLogDescriptor;
 import org.apache.cassandra.db.commitlog.CommitLogReadHandler;
 import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.db.partitions.PartitionUpdate;
-import org.apache.cassandra.db.rows.Row;
-import org.apache.cassandra.db.rows.Unfiltered;
-import org.apache.cassandra.db.rows.UnfilteredRowIterator;
+import org.apache.cassandra.db.rows.*;
 import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.kafka.common.protocol.types.Field;
 import org.apache.kafka.connect.data.Schema;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -333,8 +331,8 @@ public class CommitLogReadHandlerImpl implements CommitLogReadHandler {
             }
 
             recordMaker.delete(DatabaseDescriptor.getClusterName(), offsetPosition, keyspaceTable, false,
-                    Conversions.toInstantFromMicros(pu.maxTimestamp()), after, keySchema, valueSchema,
-                    MARK_OFFSET, queue::enqueue);
+                Conversions.toInstantFromMicros(pu.maxTimestamp()), after, keySchema, valueSchema,
+                MARK_OFFSET, queue::enqueue);
         }
         catch (Exception e) {
             LOGGER.error("Fail to delete partition at {}. Reason: {}", offsetPosition, e);
@@ -372,17 +370,17 @@ public class CommitLogReadHandlerImpl implements CommitLogReadHandler {
         switch (rowType) {
             case INSERT:
                 recordMaker.insert(DatabaseDescriptor.getClusterName(), offsetPosition, keyspaceTable, false,
-                        Conversions.toInstantFromMicros(ts), after, keySchema, valueSchema, MARK_OFFSET, queue::enqueue);
+                    Conversions.toInstantFromMicros(ts), after, keySchema, valueSchema, MARK_OFFSET, queue::enqueue);
                 break;
 
             case UPDATE:
                 recordMaker.update(DatabaseDescriptor.getClusterName(), offsetPosition, keyspaceTable, false,
-                        Conversions.toInstantFromMicros(ts), after, keySchema, valueSchema, MARK_OFFSET, queue::enqueue);
+                    Conversions.toInstantFromMicros(ts), after, keySchema, valueSchema, MARK_OFFSET, queue::enqueue);
                 break;
 
             case DELETE:
                 recordMaker.delete(DatabaseDescriptor.getClusterName(), offsetPosition, keyspaceTable, false,
-                        Conversions.toInstantFromMicros(ts), after, keySchema, valueSchema, MARK_OFFSET, queue::enqueue);
+                    Conversions.toInstantFromMicros(ts), after, keySchema, valueSchema, MARK_OFFSET, queue::enqueue);
                 break;
 
             default:
@@ -410,7 +408,7 @@ public class CommitLogReadHandlerImpl implements CommitLogReadHandler {
             }
             catch (Exception e) {
                 LOGGER.debug("Failed to deserialize Column {} with Type {} in Table {} and KeySpace {}.",
-                        cd.name.toString(), cd.type, cd.cfName, cd.ksName);
+                    cd.name.toString(), cd.type, cd.cfName, cd.ksName);
                 throw e;
             }
         }
@@ -419,21 +417,65 @@ public class CommitLogReadHandlerImpl implements CommitLogReadHandler {
     private void populateRegularColumns(RowData after, Row row, RowType rowType, SchemaHolder.KeyValueSchema schema) {
         if (rowType == INSERT || rowType == UPDATE) {
             for (ColumnDefinition cd : row.columns()) {
-                org.apache.cassandra.db.rows.Cell cell = row.getCell(cd);
-                String name = cd.name.toString();
-                try {
-                    Object value = cell.isTombstone() ? null : CassandraTypeDeserializer.deserialize(cd.type, cell.value());
-                    Object deletionTs = cell.isExpiring() ? TimeUnit.MICROSECONDS.convert(cell.localDeletionTime(), TimeUnit.SECONDS) : null;
-                    CellData cellData = new CellData(name, value, deletionTs, CellData.ColumnType.REGULAR);
-                    after.addCell(cellData);
-                }
-                catch (Exception e) {
-                    LOGGER.debug("Failed to deserialize Column {} with Type {} in Table {} and KeySpace {}.",
+                org.apache.cassandra.db.rows.Cell cell;
+                if(!cd.isComplex()){
+                    cell = row.getCell(cd);
+                    String name = cd.name.toString();
+                    try {
+                        Object value = cell.isTombstone() ? null : CassandraTypeDeserializer.deserialize(cd.type, cell.value());
+                        Object deletionTs = cell.isExpiring() ? TimeUnit.MICROSECONDS.convert(cell.localDeletionTime(), TimeUnit.SECONDS) : null;
+                        CellData cellData = new CellData(name, value, deletionTs, CellData.ColumnType.REGULAR);
+                        after.addCell(cellData);
+                    }
+                    catch (Exception e) {
+                        LOGGER.debug("Failed to deserialize Column {} with Type {} in Table {} and KeySpace {}.",
                             cd.name.toString(), cd.type, cd.cfName, cd.ksName);
-                    throw e;
+                        throw e;
+                    }
+                }
+                else{
+
+                    ComplexColumnData complexColumnData = row.getComplexColumnData(cd);
+                    ColumnDefinition complexcd = complexColumnData.column();
+                    String name = complexcd.name.toString();
+
+                    // Iterate through the complex data and build a map
+
+                    Iterator<Cell> iterator = (complexColumnData == null) ? Collections.<Cell>emptyIterator() : complexColumnData.iterator();
+                    //StringBuilder stringBuilder = new StringBuilder();
+
+                    //TODO: Only map data types are handled for now, need to handle arrays,sets etc
+                    Map<String,String> map = new HashMap<String,String>();
+
+                    while(iterator.hasNext()){
+                        cell = iterator.next();
+                        String patternString = "\\[\\w+\\[(\\w+)\\]\\=(\\w+) ts\\=(\\d+)\\]";
+                        Pattern pattern =Pattern.compile(patternString);
+                        Matcher matcher = pattern.matcher(cell.toString());
+                        if (matcher.matches()){
+                            String mapKey = matcher.group(1);
+                            String mapValue = matcher.group(2);
+                            String timestamp =  matcher.group(3);
+                            map.put(mapKey,mapValue);
+                        }
+                        //stringBuilder.append(cell);
+                    }
+                    try {
+                       /* Map<String,String> map = new HashMap<String,String>();
+                        map.put("key", stringBuilder.toString());
+                        Object value =map;
+                        */
+                        Object deletionTs = null;
+                        CellData cellData = new CellData(name, map, deletionTs, CellData.ColumnType.REGULAR);
+                        after.addCell(cellData);
+                    }
+                    catch (Exception e) {
+                        LOGGER.debug("Failed to deserialize Column {} with Type {} in Table {} and KeySpace {}.",
+                            cd.name.toString(), cd.type, cd.cfName, cd.ksName);
+                        throw e;
+                    }
                 }
             }
-
         }
         else if (rowType == DELETE) {
             // For row-level deletions, row.columns() will result in an empty list and does not contain
@@ -472,7 +514,7 @@ public class CommitLogReadHandlerImpl implements CommitLogReadHandler {
             }
             catch (Exception e) {
                 LOGGER.debug("Failed to deserialize Column {} with Type {} in Table {} and KeySpace {}.",
-                        cs.name.toString(), cs.type, cs.cfName, cs.ksName);
+                    cs.name.toString(), cs.type, cs.cfName, cs.ksName);
                 throw e;
             }
 
@@ -507,7 +549,7 @@ public class CommitLogReadHandlerImpl implements CommitLogReadHandler {
                 }
                 catch (Exception e) {
                     LOGGER.debug("Failed to deserialize Column {} with Type {} in Table {} and KeySpace {}",
-                            cs.name.toString(), cs.type, cs.cfName, cs.ksName);
+                        cs.name.toString(), cs.type, cs.cfName, cs.ksName);
                     throw e;
                 }
                 byte b = keyBytes.get();
